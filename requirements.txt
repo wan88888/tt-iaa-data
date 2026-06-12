@@ -1,0 +1,6 @@
+requests>=2.31.0
+PyYAML>=6.0
+# 仅当 cookie_source=browser（从本机浏览器自动读取 Cookie）时需要：
+browser-cookie3>=0.19.1
+# 仅当 bigquery.enabled=true（写入数仓）时需要：
+google-cloud-bigquery>=3.0.0

@@ -1,0 +1,13 @@
+# 含登录 Cookie（等同账号凭证），切勿提交
+config.yaml
+
+# Google 服务账号密钥（含私钥），切勿提交
+gzdw2024-*.json
+*-service-account*.json
+service-account*.json
+
+# 运行环境与输出
+.venv/
+output/
+__pycache__/
+*.pyc
