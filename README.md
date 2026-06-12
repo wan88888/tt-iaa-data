@@ -1,16 +1,22 @@
 # TikTok IAA 数据抓取脚本
 
-每天执行一次，拉取所有游戏 × 所有地区的「营收 - 应用内广告 (IAA)」数据，
-输出一张按 **游戏 / 地区** 区分的表：`output/iaa_<日期>.csv`。
+拉取所有游戏 × 所有地区的「营收 - 应用内广告 (IAA)」数据，输出一张按 **游戏 / 地区 / 日期** 区分的表，并可自动写入 BigQuery 数仓。
 
-游戏列表读自游戏信息表 CSV（`游戏全称` / `app_id` / `key` 等列），
-地区与日期在 `config.yaml` 配置。
+游戏列表读自游戏信息表 CSV（`游戏全称` / `app_id` / `key` 等列），地区与日期在 `config.yaml` 配置。
+
+## 给运营同学：最简用法（双击即可）
+
+1. **第一次**：双击 `setup.command`，自动装好运行环境（联网，约 1-2 分钟）。
+2. **以后每天**：双击 `run.command`，跑完自动打开结果文件夹。
+3. 想让它**每天自动跑**：双击 `install_schedule.command`（默认每天 18:00），不想要了双击 `uninstall_schedule.command`。
+
+运行结束会显示一个**摘要**（总收入、收入 Top 5、结果文件等）。若提示「登录态失效」，按提示在浏览器重新登录后台再跑一次即可。
 
 ## 指标
 
-广告请求 `广告请求`、广告曝光 `广告曝光`、广告点击 `广告点击`、点击率 `点击率(%)`、`eCPM`、广告收入 `广告收入(USD)`。
+广告请求、广告曝光、广告点击、点击率(%)、eCPM、广告收入(USD)。
 
-## 安装
+## 手动安装（开发者）
 
 ```bash
 pip install -r requirements.txt
@@ -20,24 +26,28 @@ pip install -r requirements.txt
 
 ## 配置 `config.yaml`
 
-1. **cookie**：开发者后台页面按 `F12` → `Network` → 找到 `iaa` 请求 → 右键 `Copy` → `Copy as cURL`，把 `-b '...'` 引号内的内容粘进 `cookie`。Cookie 会过期，失效时重新复制。
-2. **date / date_offset_days / days_back**：`date` 留空时自动抓最近 `days_back` 天（默认 2 = 昨天 + 前天），最新一天为「今天 - date_offset_days」。也可把 `date` 写成具体某天（如 `"2026-06-11"`，只抓那天）。
-3. **games_csv**：游戏信息表路径（默认 `游戏信息表 - TT.csv`）。
-4. **game_status_filter**：只抓这些状态的游戏，默认 `["已过审"]`（`开发中` 的游戏一般没数据）。
-5. **regions**：地区中文/英文名列表，脚本自动转地区码。
+1. **cookie_source**：默认 `browser`（自动从已登录的 Chrome 读取 Cookie，免手动复制）；也可设为 `config` 手动粘贴到 `cookie` 字段。失效时脚本会图文提示，并自动打开后台登录页。
+2. **include_total**：默认 `true`，额外抓「全部地区」汇总（对应后台筛选条件=全部），地区列显示为 `total`。
+3. **date / date_offset_days / days_back**：`date` 留空时自动抓最近 `days_back` 天（默认 2 = 昨天 + 前天），最新一天为「今天 - date_offset_days」。也可把 `date` 写成具体某天（如 `"2026-06-11"`，只抓那天）。
+4. **games_csv**：游戏信息表路径（默认 `游戏信息表 - TT.csv`）。
+5. **game_status_filter**：只抓这些状态的游戏，默认 `["已过审"]`。
+6. **regions**：地区中文/英文名列表，脚本自动转地区码。
 
-## 运行
+## 运行（命令行）
 
 ```bash
-# 按 config 自动取日期（默认昨天）
+# 按 config 自动取日期（默认昨天 + 前天）
 python scraper.py
 
 # 指定某一天
 python scraper.py --date 2026-06-10
+
+# 临时覆盖 Cookie 来源
+python scraper.py --cookie-source config
 ```
 
 结果写入 `output/iaa_<起>_<止>.csv`（单天时为 `output/iaa_<日期>.csv`），一张表。
-列：`日期, 游戏, key, 地区, 广告请求, 广告曝光, 广告点击, 点击率(%), eCPM, 广告收入(USD)`，按游戏、地区、日期排序；地区为简写码（如 my、us）。
+列：`日期, 游戏, key, 地区, 广告请求, 广告曝光, 广告点击, 点击率(%), eCPM, 广告收入(USD)`，按游戏、地区、日期排序；地区为简写码（如 my、us），`total` 表示全部地区汇总。
 
 ## 写入 BigQuery 数仓
 
@@ -56,14 +66,20 @@ ad_clicks / ctr / ecpm / ad_revenue`，其中 `country` 为地区码、`ctr` 为
 
 依赖：`pip install google-cloud-bigquery`。凭证文件含私钥，已在 `.gitignore` 中排除，切勿外传。
 
+## 定时自动跑（macOS launchd）
+
+双击 `install_schedule.command` 安装（默认每天 18:00；改时间编辑该文件顶部的 `HOUR/MINUTE`）。
+日志写入 `logs/`，只保留最近 30 次。卸载双击 `uninstall_schedule.command`。
+
+注意：定时运行无终端界面。若用 `cookie_source: browser`，需保持已在浏览器登录后台且授权过钥匙串访问；否则改用 `config` 手动 Cookie（但会过期）。
+
 ## 重要说明：数据延迟
 
 TikTok 后台数据有延迟：**昨天 (T-1) 的数据当天下午往往还没出全，会返回 0**；
-前天 (T-2) 的数据通常已完整。若发现昨天全是 0，可在 `config.yaml` 把
-`date_offset_days` 改为 `2`（拉前天），或晚点再跑。
+前天 (T-2) 的数据通常已完整。默认连前天一起抓（`days_back: 2`）即为此设计。
 
 ## 其它说明
 
 - 某些地区对某些游戏返回 0，是因为该游戏在当地没有量（属正常）。
-- 个别 (游戏,地区) 因无权限/无数据会被自动跳过并记录日志，不影响整体。
-- `config.yaml` 含真实登录 Cookie（等同账号凭证），已在 `.gitignore` 中排除，切勿外传。
+- 个别 (游戏,地区) 因无权限/无数据会被自动跳过，计入摘要的「跳过」数，不影响整体。
+- `config.yaml`（含 Cookie）与服务账号密钥文件已在 `.gitignore` 中排除，切勿外传。

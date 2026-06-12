@@ -150,8 +150,14 @@ def resolve_dates(cfg: dict, cli_date: str | None) -> list[str]:
 
 
 def resolve_regions(cfg: dict) -> list[tuple[str, str]]:
-    """把配置里的地区名解析为 (显示名, 地区码) 列表。"""
+    """把配置里的地区名解析为 (显示名, 地区码) 列表。
+
+    include_total=true 时追加一项「全部」(code=total)：请求不带 region 参数，
+    对应后台「筛选条件=全部」的汇总数据。
+    """
     result = []
+    if cfg.get("include_total", True):
+        result.append(("全部(total)", "total"))
     for name in cfg["regions"]:
         name = str(name).strip()
         code = REGION_NAME_TO_CODE.get(name.lower())
@@ -251,14 +257,18 @@ def fetch_iaa(
     region_code: str,
     ad_type: int,
 ) -> dict:
-    """请求单个(游戏, 地区, 单日)的 IAA 数据。start_time=end_time=day。"""
+    """请求单个(游戏, 地区, 单日)的 IAA 数据。start_time=end_time=day。
+
+    region_code 为 "total"（或空）时省略 region 参数，即后台「筛选条件=全部」。
+    """
     params = {
         "client_key": client_key,
         "start_time": day,
         "end_time": day,
-        "region": region_code,
         "ad_type": ad_type,
     }
+    if region_code and region_code != "total":
+        params["region"] = region_code
     headers = {"referer": build_referer(app_id)}
     resp = session.get(API_URL, params=params, headers=headers, timeout=30)
 
@@ -422,14 +432,125 @@ def upload_to_bigquery(records: list, days: list, bq_cfg: dict):
     logger.info("BigQuery: 完成，已写入 %s。", table_id)
 
 
+class ProgressBar:
+    """简单的终端进度条；非 TTY 环境（如定时任务）自动降级为不输出。"""
+
+    def __init__(self, total: int, width: int = 32):
+        self.total = total
+        self.width = width
+        self.done = 0
+        self.enabled = sys.stderr.isatty()
+
+    def update(self, n: int = 1):
+        self.done += n
+        if not self.enabled:
+            return
+        frac = self.done / self.total if self.total else 1.0
+        filled = int(self.width * frac)
+        bar = "#" * filled + "-" * (self.width - filled)
+        sys.stderr.write(f"\r  进度 [{bar}] {self.done}/{self.total} ({frac*100:4.0f}%)")
+        sys.stderr.flush()
+
+    def close(self):
+        if self.enabled:
+            sys.stderr.write("\n")
+            sys.stderr.flush()
+
+
+PORTAL_URL = "https://developers.us.tiktok.com/"
+
+
+def handle_login_failure(cfg: dict):
+    """登录失效时给出图文化指引，并按配置自动打开后台登录页。"""
+    source = (cfg.get("cookie_source") or "config").strip().lower()
+    logger.error("=" * 56)
+    logger.error("  登录态已失效（Cookie 过期或未登录），无法获取数据。")
+    logger.error("=" * 56)
+    if source == "browser":
+        browser = cfg.get("browser") or "chrome"
+        logger.error("  解决方法（当前为浏览器自动读取模式）：")
+        logger.error("   1) 在 %s 浏览器里打开并登录 TikTok 开发者后台", browser)
+        logger.error("   2) 确认能正常看到营收页面后，重新运行本工具即可")
+    else:
+        logger.error("  解决方法（当前为手动 Cookie 模式）：")
+        logger.error("   1) 浏览器登录开发者后台 -> F12 -> Network -> 找到 iaa 请求")
+        logger.error("   2) 右键 Copy -> Copy as cURL，复制其中 -b '...' 的内容")
+        logger.error("   3) 粘贴到 config.yaml 的 cookie 字段后，重新运行")
+        logger.error("   （也可把 cookie_source 改为 browser，自动从已登录浏览器读取）")
+    if cfg.get("open_login_on_expire", True) and sys.stderr.isatty():
+        import subprocess
+
+        try:
+            subprocess.run(["open", PORTAL_URL], check=False)
+            logger.error("  已为你打开后台登录页：%s", PORTAL_URL)
+        except Exception:  # noqa: BLE001
+            logger.error("  请手动打开后台登录：%s", PORTAL_URL)
+    else:
+        logger.error("  后台地址：%s", PORTAL_URL)
+    logger.error("=" * 56)
+
+
+def print_summary(*, days, rows, skipped, failed, failures, out_path, bq_enabled):
+    """结束时打印关键数字摘要。"""
+    total_rows = [r for r in rows if r["地区"] == "total"]
+    region_rows = [r for r in rows if r["地区"] != "total"]
+    # 真实总收入：有 total 行时用 total 行（避免与各地区行重复计），否则用各地区行
+    rev_basis = total_rows if total_rows else region_rows
+    total_rev = sum((r.get("广告收入(USD)") or 0) for r in rev_basis)
+    nonzero = [r for r in rows if (r.get("广告收入(USD)") or 0) > 0]
+
+    # 收入 Top 5（具体游戏@地区，排除 total 行避免重复）
+    top = sorted(region_rows, key=lambda r: (r.get("广告收入(USD)") or 0), reverse=True)[:5]
+
+    lines = []
+    lines.append("")
+    lines.append("=" * 56)
+    lines.append("  抓取完成 ✓  摘要")
+    lines.append("-" * 56)
+    lines.append(f"  日期范围   : {', '.join(days)}")
+    lines.append(f"  数据行数   : {len(rows)}（其中有收入 {len(nonzero)} 行）")
+    lines.append(f"  总广告收入 : ${total_rev:,.2f}")
+    if skipped:
+        lines.append(f"  跳过(无数据): {skipped}")
+    if failed:
+        lines.append(f"  请求失败   : {failed}")
+    lines.append(f"  结果文件   : {out_path}")
+    lines.append(f"  写入数仓   : {'是' if bq_enabled else '否'}")
+    if top and (top[0].get("广告收入(USD)") or 0) > 0:
+        lines.append("-" * 56)
+        lines.append("  收入 Top 5（游戏 @ 地区 @ 日期）：")
+        for r in top:
+            rev = r.get("广告收入(USD)") or 0
+            if rev <= 0:
+                break
+            lines.append(
+                f"    ${rev:>10,.2f}  {r['游戏']} @ {r['地区']} @ {r['日期']}"
+            )
+    if failures:
+        lines.append("-" * 56)
+        lines.append("  失败明细（最多显示 10 条）：")
+        for g, rn, d, msg in failures[:10]:
+            lines.append(f"    {g} @ {rn} @ {d}: {msg}")
+    lines.append("=" * 56)
+    print("\n".join(lines))
+
+
 def main():
     parser = argparse.ArgumentParser(description="抓取 TikTok 开发者后台 IAA 数据")
     parser.add_argument("--config", default="config.yaml", help="配置文件路径")
     parser.add_argument("--output-dir", default="output", help="CSV 输出目录")
     parser.add_argument("--date", default=None, help="抓取日期 YYYY-MM-DD，默认昨天")
+    parser.add_argument(
+        "--cookie-source",
+        default=None,
+        choices=["config", "browser"],
+        help="覆盖 config 的 cookie_source（config=手动粘贴 / browser=从浏览器读）",
+    )
     args = parser.parse_args()
 
     cfg = load_config(Path(args.config))
+    if args.cookie_source:
+        cfg["cookie_source"] = args.cookie_source
 
     cookie = get_cookie_string(cfg)
     days = resolve_dates(cfg, args.date)
@@ -441,7 +562,7 @@ def main():
 
     total = len(games) * len(regions) * len(days)
     logger.info(
-        "抓取日期=%s | 游戏 %d 个 | 地区 %d 个 | 共 %d 个请求 | 并发 %d",
+        "抓取日期=%s | 游戏 %d 个 | 地区 %d 个（含全部） | 共 %d 个请求 | 并发 %d",
         ",".join(days),
         len(games),
         len(regions),
@@ -455,11 +576,12 @@ def main():
     abort_event = threading.Event()
     rows: list = []
     bq_records: list = []
+    failures: list = []  # (game, region_name, day, msg)
     skipped = 0
     failed = 0
     login_failed = False
-    done = 0
 
+    bar = ProgressBar(total)
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
         futures = {
             executor.submit(_do_one, session, game, region, day, ad_type, abort_event): (
@@ -472,7 +594,6 @@ def main():
         for future in as_completed(futures):
             game, region, day = futures[future]
             region_name = region[0]
-            done += 1
             status, payload = future.result()
             if status == "ok":
                 row, bq = payload
@@ -480,17 +601,17 @@ def main():
                 bq_records.append(bq)
             elif status == "nodata":
                 skipped += 1
-                logger.warning("[%d/%d] 跳过 %s @ %s %s: %s", done, total, game["name"], region_name, day, payload)
             elif status == "failed":
                 failed += 1
-                logger.error("[%d/%d] 失败 %s @ %s %s: %s", done, total, game["name"], region_name, day, payload)
+                failures.append((game["name"], region_name, day, str(payload)))
             elif status == "login":
                 login_failed = True
-                logger.error("[%d/%d] 登录态失效: %s", done, total, payload)
             # aborted: 静默跳过（登录失效后剩余任务）
+            bar.update()
+    bar.close()
 
     if login_failed:
-        logger.error("登录态失效，请更新 Cookie 后重试（手动粘贴或用 cookie_source=browser）。")
+        handle_login_failure(cfg)
         if not rows:
             sys.exit(2)
 
@@ -507,20 +628,25 @@ def main():
     out_path = Path(args.output_dir) / f"iaa_{suffix}.csv"
     write_csv(out_path, fieldnames, rows)
 
-    logger.info("完成。%d 行 -> %s", len(rows), out_path)
-    if skipped:
-        logger.info("跳过(无数据/无权限) %d 个组合。", skipped)
-    if failed:
-        logger.warning("请求失败 %d 个组合。", failed)
-
     bq_cfg = cfg.get("bigquery") or {}
-    if bq_cfg.get("enabled"):
+    bq_enabled = bool(bq_cfg.get("enabled"))
+    if bq_enabled:
         if failed:
             logger.warning(
                 "有 %d 个请求失败，本次数据不完整；仍按配置写入 BigQuery（如需完整数据请重跑）。",
                 failed,
             )
         upload_to_bigquery(bq_records, sorted_days, bq_cfg)
+
+    print_summary(
+        days=days,
+        rows=rows,
+        skipped=skipped,
+        failed=failed,
+        failures=failures,
+        out_path=out_path,
+        bq_enabled=bq_enabled,
+    )
 
 
 if __name__ == "__main__":

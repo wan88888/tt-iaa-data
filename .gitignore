@@ -15,5 +15,6 @@ service-account*.json
 # 运行环境与输出
 .venv/
 output/
+logs/
 __pycache__/
 *.pyc
