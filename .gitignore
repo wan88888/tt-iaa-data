@@ -6,6 +6,12 @@ gzdw2024-*.json
 *-service-account*.json
 service-account*.json
 
+# macOS
+.DS_Store
+
+# 游戏信息表（含内部 key，不提交仓库）
+游戏信息表 - TT.csv
+
 # 运行环境与输出
 .venv/
 output/
