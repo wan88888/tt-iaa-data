@@ -27,11 +27,22 @@ pip install -r requirements.txt
 ## 配置 `config.yaml`
 
 1. **cookie_source**：默认 `browser`（自动从已登录的 Chrome 读取 Cookie，免手动复制）；也可设为 `config` 手动粘贴到 `cookie` 字段。失效时脚本会图文提示，并自动打开后台登录页。
-2. **include_total**：默认 `true`，额外抓「全部地区」汇总（对应后台筛选条件=全部），地区列显示为 `total`。
-3. **date / date_offset_days / days_back**：`date` 留空时自动抓最近 `days_back` 天（默认 2 = 昨天 + 前天），最新一天为「今天 - date_offset_days」。也可把 `date` 写成具体某天（如 `"2026-06-11"`，只抓那天）。
-4. **games_csv**：游戏信息表路径（默认 `游戏信息表 - TT.csv`）。
-5. **game_status_filter**：只抓这些状态的游戏，默认 `["已过审"]`。
+2. **games_source**：默认 `api`（从后台自动获取游戏列表 `app_id`+`key`，无需手动维护 CSV，新游戏自动纳入）；需配 `org_id`（后台 `organization/<数字>` 链接里的数字）。设为 `csv` 则读 `games_csv`。
+   - `approved_only`：默认 `true`，只抓已过审游戏（接口 `app_status==1`）。
+   - `exclude_games`：按游戏名或 app_id 排除不想统计的游戏。
+   - 每次成功获取后写入快照 `games_cache_csv`（默认 `games_auto.csv`）；**下次 api 获取失败时自动回退读取该快照**。
+3. **include_total**：默认 `true`，额外抓「全部地区」汇总（对应后台筛选条件=全部），地区列显示为 `total`。
+4. **date / date_offset_days / days_back**：`date` 留空时自动抓最近 `days_back` 天（默认 2 = 昨天 + 前天），最新一天为「今天 - date_offset_days」。也可把 `date` 写成具体某天（如 `"2026-06-11"`，只抓那天）。
+5. **game_status_filter**：仅 `games_source=csv` 生效，只抓这些状态的游戏，默认 `["已过审"]`。
 6. **regions**：地区中文/英文名列表，脚本自动转地区码。
+
+### 自动同步游戏列表
+
+`games_source: api` 时，每次运行会自动从后台拉取最新游戏。也可单独同步并导出到 CSV 查看：
+
+```bash
+python sync_games.py            # 写入 games_auto.csv
+```
 
 ## 运行（命令行）
 
@@ -68,7 +79,7 @@ ad_clicks / ctr / ecpm / ad_revenue`，其中 `country` 为地区码、`ctr` 为
 
 ## 定时自动跑（macOS launchd）
 
-双击 `install_schedule.command` 安装（默认每天 18:00；改时间编辑该文件顶部的 `HOUR/MINUTE`）。
+双击 `install_schedule.command` 安装（默认每天 10:00 和 18:00 各一次；改时间编辑该文件顶部的 `TIMES`）。
 日志写入 `logs/`，只保留最近 30 次。卸载双击 `uninstall_schedule.command`。
 
 注意：定时运行无终端界面。若用 `cookie_source: browser`，需保持已在浏览器登录后台且授权过钥匙串访问；否则改用 `config` 手动 Cookie（但会过期）。

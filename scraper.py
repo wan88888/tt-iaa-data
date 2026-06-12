@@ -83,8 +83,12 @@ def load_config(path: Path) -> dict:
         logger.error("config.yaml 未配置任何 regions。")
         sys.exit(1)
 
-    if not (cfg.get("games_csv") or "").strip():
-        logger.error("config.yaml 未配置 games_csv（游戏信息表路径）。")
+    source = (cfg.get("games_source") or "csv").strip().lower()
+    if source == "csv" and not (cfg.get("games_csv") or "").strip():
+        logger.error("games_source=csv 时必须配置 games_csv（游戏信息表路径）。")
+        sys.exit(1)
+    if source == "api" and not str(cfg.get("org_id") or "").strip():
+        logger.error("games_source=api 时必须配置 org_id（组织 ID）。")
         sys.exit(1)
 
     return cfg
@@ -201,6 +205,58 @@ def load_games(csv_path: Path, status_filter: list[str]) -> list[dict]:
         logger.error("游戏信息表中没有匹配的游戏（检查 game_status_filter / key 列）。")
         sys.exit(1)
     return games
+
+
+def resolve_games(cfg: dict, session) -> list[dict]:
+    """根据 games_source 选择游戏来源。
+
+    - api：从后台接口自动获取（app_id + client_key），无需手动维护 CSV；
+           失败时若存在 games_csv 则回退到 CSV。
+    - csv：读取游戏信息表（默认行为，可用 game_status_filter 过滤状态）。
+    """
+    source = (cfg.get("games_source") or "csv").strip().lower()
+    if source == "api":
+        import sync_games
+
+        org_id = str(cfg.get("org_id") or "").strip()
+        cache_path = Path((cfg.get("games_cache_csv") or "games_auto.csv").strip())
+        try:
+            api_games = sync_games.fetch_games_from_api(
+                session,
+                org_id,
+                concurrency=max(int(cfg.get("concurrency", 8)), 1),
+                exclude=cfg.get("exclude_games"),
+                approved_only=cfg.get("approved_only", True),
+            )
+        except Exception as exc:  # noqa: BLE001 网络/登录等多种原因
+            logger.error("从后台自动获取游戏列表失败：%s", exc)
+            api_games = []
+        if api_games:
+            logger.info("已从后台自动获取 %d 个游戏。", len(api_games))
+            # 成功则更新本地快照，供下次失败时回退
+            try:
+                sync_games.write_games_csv(api_games, cache_path)
+            except OSError as exc:
+                logger.warning("写入游戏快照 %s 失败：%s", cache_path, exc)
+            return [
+                {
+                    "name": g["name"],
+                    "app_id": g["app_id"],
+                    "client_key": g["client_key"],
+                    "status": "",
+                }
+                for g in api_games
+            ]
+        # 回退：读取上次成功保存的快照 games_auto.csv
+        if cache_path.exists():
+            logger.warning("自动获取失败，回退到上次快照：%s", cache_path)
+            return load_games(cache_path, [])
+        logger.error(
+            "自动获取游戏失败，且没有可回退的快照 %s，请检查登录态/org_id。", cache_path
+        )
+        sys.exit(2)
+
+    return load_games(Path(cfg["games_csv"]), cfg.get("game_status_filter") or [])
 
 
 def build_session(cookie: str, *, concurrency: int = 1, max_retries: int = 2) -> requests.Session:
@@ -558,7 +614,9 @@ def main():
     concurrency = max(int(cfg.get("concurrency", 8)), 1)
     max_retries = int(cfg.get("max_retries", 2))
     regions = resolve_regions(cfg)
-    games = load_games(Path(cfg["games_csv"]), cfg.get("game_status_filter") or [])
+
+    session = build_session(cookie, concurrency=concurrency, max_retries=max_retries)
+    games = resolve_games(cfg, session)
 
     total = len(games) * len(regions) * len(days)
     logger.info(
@@ -569,8 +627,6 @@ def main():
         total,
         concurrency,
     )
-
-    session = build_session(cookie, concurrency=concurrency, max_retries=max_retries)
 
     tasks = [(game, region, day) for day in days for game in games for region in regions]
     abort_event = threading.Event()
