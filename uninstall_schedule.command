@@ -6,8 +6,10 @@ cd "$(dirname "$0")" || exit 1
 LABEL="com.tt.iaa.daily"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 
+launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null
+launchctl unload "$PLIST" 2>/dev/null
+
 if [ -f "$PLIST" ]; then
-  launchctl unload "$PLIST" 2>/dev/null
   rm -f "$PLIST"
   echo "已卸载定时任务。"
 else
