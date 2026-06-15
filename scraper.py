@@ -130,25 +130,53 @@ def get_cookie_string(cfg: dict) -> str:
     return cookie
 
 
-def resolve_dates(cfg: dict, cli_date: str | None) -> list[str]:
-    """确定抓取日期列表。
+def _parse_date(raw: str) -> date:
+    try:
+        return datetime.strptime(raw.strip(), "%Y-%m-%d").date()
+    except ValueError:
+        logger.error("日期格式应为 YYYY-MM-DD，收到: %s", raw)
+        sys.exit(1)
 
-    - CLI/config 显式指定 date：只抓那一天。
-    - 否则抓最近 days_back 天，最新一天为 今天 - date_offset_days。
-      默认 date_offset_days=1、days_back=2 → 昨天 + 前天。
+
+def resolve_dates(
+    cfg: dict,
+    cli_date: str | None = None,
+    *,
+    start: str | None = None,
+    end: str | None = None,
+    days: int | None = None,
+) -> list[str]:
+    """确定抓取日期列表（按时间从新到旧返回）。
+
+    优先级：
+    1. --start/--end 区间（补数用）：返回区间内每一天（含两端）。
+    2. --date 单天（可配合 --days 往前回溯 N 天）。
+    3. config.date 单天。
+    4. 默认：最近 days_back 天，最新一天为 今天 - date_offset_days。
+
     注意：TikTok 后台数据有延迟，昨天(T-1)当天往往还未出全，故默认连前天一起抓。
     """
+    # 1) 区间
+    if start or end:
+        if not (start and end):
+            logger.error("--start 与 --end 必须同时指定。")
+            sys.exit(1)
+        d0, d1 = _parse_date(start), _parse_date(end)
+        if d0 > d1:
+            d0, d1 = d1, d0
+        span = (d1 - d0).days
+        return [(d1 - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(span + 1)]
+
+    # 2/3) 单天（可带 days 回溯）
     raw = (cli_date or str(cfg.get("date") or "")).strip()
     if raw:
-        try:
-            datetime.strptime(raw, "%Y-%m-%d")
-        except ValueError:
-            logger.error("日期格式应为 YYYY-MM-DD，收到: %s", raw)
-            sys.exit(1)
-        return [raw]
+        latest = _parse_date(raw)
+        n = max(int(days), 1) if days else 1
+        return [(latest - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(n)]
 
+    # 4) 默认窗口
     offset = int(cfg.get("date_offset_days", 1))
-    days_back = max(int(cfg.get("days_back", 2)), 1)
+    days_back = max(int(days) if days else int(cfg.get("days_back", 2)), 1)
     latest = date.today() - timedelta(days=offset)
     return [(latest - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(days_back)]
 
@@ -595,7 +623,12 @@ def main():
     parser = argparse.ArgumentParser(description="抓取 TikTok 开发者后台 IAA 数据")
     parser.add_argument("--config", default="config.yaml", help="配置文件路径")
     parser.add_argument("--output-dir", default="output", help="CSV 输出目录")
-    parser.add_argument("--date", default=None, help="抓取日期 YYYY-MM-DD，默认昨天")
+    parser.add_argument("--date", default=None, help="抓取单天 YYYY-MM-DD（默认昨天+前天）")
+    parser.add_argument("--start", default=None, help="补数起始日 YYYY-MM-DD（需配合 --end）")
+    parser.add_argument("--end", default=None, help="补数结束日 YYYY-MM-DD（需配合 --start）")
+    parser.add_argument(
+        "--days", type=int, default=None, help="往前回溯的天数（配合 --date 或默认窗口）"
+    )
     parser.add_argument(
         "--cookie-source",
         default=None,
@@ -609,7 +642,7 @@ def main():
         cfg["cookie_source"] = args.cookie_source
 
     cookie = get_cookie_string(cfg)
-    days = resolve_dates(cfg, args.date)
+    days = resolve_dates(cfg, args.date, start=args.start, end=args.end, days=args.days)
     ad_type = int(cfg.get("ad_type", 1))
     concurrency = max(int(cfg.get("concurrency", 8)), 1)
     max_retries = int(cfg.get("max_retries", 2))

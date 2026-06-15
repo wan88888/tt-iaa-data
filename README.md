@@ -2,13 +2,13 @@
 
 拉取所有游戏 × 所有地区的「营收 - 应用内广告 (IAA)」数据，输出一张按 **游戏 / 地区 / 日期** 区分的表，并可自动写入 BigQuery 数仓。
 
-游戏列表读自游戏信息表 CSV（`游戏全称` / `app_id` / `key` 等列），地区与日期在 `config.yaml` 配置。
+游戏列表默认从后台 API 自动获取（`app_id` + `key`），地区与日期在 `config.yaml` 配置。
 
 ## 给运营同学：最简用法（双击即可）
 
 1. **第一次**：双击 `setup.command`，自动装好运行环境（联网，约 1-2 分钟）。
 2. **以后每天**：双击 `run.command`，跑完自动打开结果文件夹。
-3. 想让它**每天自动跑**：双击 `install_schedule.command`（默认每天 18:00），不想要了双击 `uninstall_schedule.command`。
+3. 想让它**每天自动跑**：双击 `install_schedule.command`（默认每天 10:00 和 18:00 各一次），不想要了双击 `uninstall_schedule.command`。
 
 运行结束会显示一个**摘要**（总收入、收入 Top 5、结果文件等）。若提示「登录态失效」，按提示在浏览器重新登录后台再跑一次即可。
 
@@ -50,12 +50,30 @@ python sync_games.py            # 写入 games_auto.csv
 # 按 config 自动取日期（默认昨天 + 前天）
 python scraper.py
 
-# 指定某一天
-python scraper.py --date 2026-06-10
+# 指定单天
+python scraper.py --date 2026-06-11
 
 # 临时覆盖 Cookie 来源
 python scraper.py --cookie-source config
 ```
+
+## 补数（指定日期 / 区间）
+
+写入 BigQuery 时按本次抓取的日期范围**先 delete 再 insert**，可重复跑，不会重复入库。
+
+```bash
+# 指定日期区间（推荐，补缺失的连续多天）
+python scraper.py --start 2026-06-11 --end 2026-06-12
+
+# 单天
+python scraper.py --date 2026-06-11
+
+# 从某天往前回溯 N 天（含当天）
+python scraper.py --date 2026-06-12 --days 3
+# → 补 2026-06-12、2026-06-11、2026-06-10
+```
+
+不带 `--start/--end/--date` 时，仍按 `config.yaml` 的 `date_offset_days` + `days_back` 抓默认窗口（定时任务走这条逻辑）。
 
 结果写入 `output/iaa_<起>_<止>.csv`（单天时为 `output/iaa_<日期>.csv`），一张表。
 列：`日期, 游戏, key, 地区, 广告请求, 广告曝光, 广告点击, 点击率(%), eCPM, 广告收入(USD)`，按游戏、地区、日期排序；地区为简写码（如 my、us），`total` 表示全部地区汇总。
