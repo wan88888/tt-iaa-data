@@ -94,40 +94,66 @@ def load_config(path: Path) -> dict:
     return cfg
 
 
+def _cookie_from_browser(cfg: dict) -> str | None:
+    """尝试从浏览器读取 Cookie，失败/不完整返回 None（不退出，留给回退）。"""
+    browser = (cfg.get("browser") or "chrome").strip().lower()
+    try:
+        import browser_cookie3
+    except ImportError:
+        logger.warning("未安装 browser-cookie3，无法从浏览器读取 Cookie（pip install browser-cookie3）。")
+        return None
+    loader = getattr(browser_cookie3, browser, None)
+    if loader is None:
+        logger.warning("不支持的 browser='%s'（可选 chrome/edge/firefox/safari 等）。", browser)
+        return None
+    try:
+        jar = loader(domain_name="tiktok.com")
+    except Exception as exc:  # noqa: BLE001 浏览器读取失败原因多样
+        logger.warning("从浏览器(%s)读取 Cookie 失败：%s", browser, exc)
+        return None
+    cookie = "; ".join(f"{c.name}={c.value}" for c in jar)
+    if "sessionid" not in cookie:
+        logger.warning("浏览器(%s)里没读到登录态(sessionid)。", browser)
+        return None
+    logger.info("已从浏览器(%s)读取 Cookie。", browser)
+    return cookie
+
+
+def _cookie_from_config(cfg: dict) -> str | None:
+    """读取 config 里的 Cookie，缺失/不完整返回 None。"""
+    cookie = (cfg.get("cookie") or "").strip()
+    if not cookie or "sessionid" not in cookie:
+        return None
+    return cookie
+
+
 def get_cookie_string(cfg: dict) -> str:
-    """获取 Cookie：cookie_source=config 用配置里的字符串；=browser 从本机浏览器读。"""
+    """获取 Cookie。
+
+    - cookie_source=browser：优先从浏览器读取，失败时自动回退到 config 的 cookie。
+    - cookie_source=config ：直接用 config 的 cookie。
+    注意：能拿到「格式完整」的 Cookie 不代表未过期；过期会在实际请求数据时
+    由 fetch_iaa 检测并触发登录失效提示。
+    """
     source = (cfg.get("cookie_source") or "config").strip().lower()
 
     if source == "browser":
-        browser = (cfg.get("browser") or "chrome").strip().lower()
-        try:
-            import browser_cookie3
-        except ImportError:
-            logger.error("cookie_source=browser 需要安装依赖：pip install browser-cookie3")
-            sys.exit(1)
-        loader = getattr(browser_cookie3, browser, None)
-        if loader is None:
-            logger.error("不支持的 browser='%s'（可选 chrome/edge/firefox/safari 等）。", browser)
-            sys.exit(1)
-        try:
-            jar = loader(domain_name="tiktok.com")
-        except Exception as exc:  # noqa: BLE001 浏览器读取失败原因多样，统一提示
-            logger.error("从浏览器读取 Cookie 失败：%s", exc)
-            logger.error("请确认已在该浏览器登录开发者后台，且授权了钥匙串访问。")
-            sys.exit(1)
-        pairs = [f"{c.name}={c.value}" for c in jar]
-        cookie = "; ".join(pairs)
-        if "sessionid" not in cookie:
-            logger.error("浏览器里没读到登录态(sessionid)，请确认已在浏览器登录开发者后台。")
-            sys.exit(1)
-        logger.info("已从浏览器(%s)读取 Cookie。", browser)
-        return cookie
-
-    cookie = (cfg.get("cookie") or "").strip()
-    if not cookie or "sessionid" not in cookie:
-        logger.error("config.yaml 的 cookie 未填写或不完整，请从浏览器复制完整 Cookie。")
+        cookie = _cookie_from_browser(cfg)
+        if cookie:
+            return cookie
+        cookie = _cookie_from_config(cfg)
+        if cookie:
+            logger.warning("浏览器读取失败，已回退使用 config.yaml 里的 Cookie。")
+            return cookie
+        logger.error("浏览器读取失败，且 config.yaml 的 cookie 未填写/不完整，无法继续。")
+        logger.error("请在浏览器登录后台，或把有效 Cookie 粘贴到 config.yaml 的 cookie 字段。")
         sys.exit(1)
-    return cookie
+
+    cookie = _cookie_from_config(cfg)
+    if cookie:
+        return cookie
+    logger.error("config.yaml 的 cookie 未填写或不完整，请从浏览器复制完整 Cookie。")
+    sys.exit(1)
 
 
 def _parse_date(raw: str) -> date:
