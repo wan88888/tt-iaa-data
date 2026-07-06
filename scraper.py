@@ -94,6 +94,16 @@ def load_config(path: Path) -> dict:
     return cfg
 
 
+# 登录态标记：不同浏览器/登录方式下会话 Cookie 命名不一（Chrome 常见
+# sessionid_tt_open，Firefox 常见 sid_tt_tt_open / sid_guard_tt_open），
+# 只要命中任一即视为已登录。
+_SESSION_MARKERS = ("sessionid", "sid_tt", "sid_guard")
+
+
+def _has_login_state(cookie: str) -> bool:
+    return any(marker in cookie for marker in _SESSION_MARKERS)
+
+
 def _cookie_from_browser(cfg: dict) -> str | None:
     """尝试从浏览器读取 Cookie，失败/不完整返回 None（不退出，留给回退）。"""
     browser = (cfg.get("browser") or "chrome").strip().lower()
@@ -112,8 +122,8 @@ def _cookie_from_browser(cfg: dict) -> str | None:
         logger.warning("从浏览器(%s)读取 Cookie 失败：%s", browser, exc)
         return None
     cookie = "; ".join(f"{c.name}={c.value}" for c in jar)
-    if "sessionid" not in cookie:
-        logger.warning("浏览器(%s)里没读到登录态(sessionid)。", browser)
+    if not _has_login_state(cookie):
+        logger.warning("浏览器(%s)里没读到登录态（未找到 sessionid/sid_tt/sid_guard）。", browser)
         return None
     logger.info("已从浏览器(%s)读取 Cookie。", browser)
     return cookie
@@ -122,7 +132,7 @@ def _cookie_from_browser(cfg: dict) -> str | None:
 def _cookie_from_config(cfg: dict) -> str | None:
     """读取 config 里的 Cookie，缺失/不完整返回 None。"""
     cookie = (cfg.get("cookie") or "").strip()
-    if not cookie or "sessionid" not in cookie:
+    if not cookie or not _has_login_state(cookie):
         return None
     return cookie
 
@@ -567,7 +577,7 @@ class ProgressBar:
             sys.stderr.flush()
 
 
-PORTAL_URL = "https://developers.us.tiktok.com/"
+PORTAL_URL = "https://developers.tiktok.com/"
 
 
 def handle_login_failure(cfg: dict):

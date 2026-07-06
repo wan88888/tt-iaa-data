@@ -36,6 +36,14 @@ if ! uv pip install --python .venv/bin/python -r requirements.txt; then
   echo "按回车键关闭…"; read -r _; exit 1
 fi
 
+if [ ! -f config.yaml ]; then
+  if [ -f config.example.yaml ]; then
+    cp config.example.yaml config.yaml
+    echo
+    echo "已根据 config.example.yaml 生成 config.yaml，请编辑后填入 org_id 等本机配置。"
+  fi
+fi
+
 echo
 echo "==================================================="
 echo " 安装完成！✓"

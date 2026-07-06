@@ -1,0 +1,65 @@
+# ============================================================
+# TikTok 开发者后台 IAA 数据抓取配置（模板）
+# 首次使用：cp config.example.yaml config.yaml，再填入本机凭证。
+# config.yaml 含 Cookie 等敏感信息，已在 .gitignore 中排除，勿提交。
+# ============================================================
+
+# Cookie 来源：
+#   browser = 优先从本机已登录浏览器读取；读取失败时自动回退用下面的 cookie 字段
+#   config  = 直接用下面的 cookie 字段（手动从浏览器复制粘贴）
+cookie_source: "browser"
+
+# browser 模式时从哪个浏览器读 Cookie（需已在该浏览器登录开发者后台）：
+#   chrome / firefox / edge / safari 等（由 browser-cookie3 支持）
+browser: "chrome"
+
+# 登录态失效时，是否自动打开后台登录页（仅在终端交互运行时生效）
+open_login_on_expire: true
+
+# 手动 Cookie（cookie_source=config 时使用，或 browser 读取失败时的回退）
+# 步骤：打开 https://developers.tiktok.com/ 并登录 ->
+#       F12 -> Network -> 找到 iaa 请求 -> Copy as cURL -> 复制 -b '...' 引号内内容
+cookie: ""
+
+# 抓取日期：
+#   留空 ""  = 自动取最近 days_back 天，最新一天为「今天 - date_offset_days」
+#   也可显式指定某一天，如 "2026-06-11"（只抓那天，忽略下面两项）
+date: ""
+
+date_offset_days: 1
+days_back: 2
+ad_type: 1
+
+# 游戏来源：api（推荐，自动获取）| csv（读本地游戏表）
+games_source: "api"
+
+# 组织 ID（games_source=api 时必填）。来自后台链接 organization/<这串数字>
+org_id: ""
+
+approved_only: true
+exclude_games: []
+games_cache_csv: "games_auto.csv"
+games_csv: "游戏信息表 - TT.csv"
+game_status_filter: ["已过审"]
+
+include_total: true
+
+regions:
+  - United States
+  - Japan
+  - Indonesia
+  - Thailand
+  - Philippines
+  - Vietnam
+  - Malaysia
+  - Brazil
+  - Saudi Arabia
+  - Turkey
+
+concurrency: 8
+max_retries: 2
+
+bigquery:
+  enabled: false
+  credentials_json: "your-service-account.json"
+  table_id: "your_project.your_dataset.your_table"
