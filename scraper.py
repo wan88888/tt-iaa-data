@@ -83,15 +83,78 @@ def load_config(path: Path) -> dict:
         logger.error("config.yaml 未配置任何 regions。")
         sys.exit(1)
 
-    source = (cfg.get("games_source") or "csv").strip().lower()
-    if source == "csv" and not (cfg.get("games_csv") or "").strip():
-        logger.error("games_source=csv 时必须配置 games_csv（游戏信息表路径）。")
-        sys.exit(1)
-    if source == "api" and not str(cfg.get("org_id") or "").strip():
-        logger.error("games_source=api 时必须配置 org_id（组织 ID）。")
-        sys.exit(1)
-
+    # games_source/org_id 的校验放到 resolve_accounts（按账号逐个校验）。
     return cfg
+
+
+# 单个账号可覆盖的字段（未设置则继承 config 顶层同名值作为默认）。
+_ACCOUNT_FIELDS = (
+    "cookie_source",
+    "browser",
+    "cookie",
+    "games_source",
+    "org_id",
+    "games_csv",
+    "games_cache_csv",
+    "game_status_filter",
+    "exclude_games",
+    "approved_only",
+    "concurrency",
+    "open_login_on_expire",
+)
+
+
+def _account_defaults(cfg: dict) -> dict:
+    d = {k: cfg.get(k) for k in _ACCOUNT_FIELDS}
+    if d.get("approved_only") is None:
+        d["approved_only"] = True
+    if d.get("concurrency") is None:
+        d["concurrency"] = 8
+    if d.get("open_login_on_expire") is None:
+        d["open_login_on_expire"] = True
+    return d
+
+
+def resolve_accounts(cfg: dict) -> list[dict]:
+    """返回账号列表。每个账号是一份「自带全部所需设置」的 dict。
+
+    - config 里有 accounts 列表：逐个与顶层默认合并（账号级优先）。
+    - 没有 accounts：用顶层字段合成单个账号（向后兼容原有行为）。
+    """
+    raw = cfg.get("accounts")
+    accounts: list[dict] = []
+    if raw:
+        for i, item in enumerate(raw):
+            item = item or {}
+            merged = _account_defaults(cfg)
+            merged.update({k: v for k, v in item.items() if v is not None})
+            name = str(item.get("name") or merged.get("name") or f"account{i + 1}").strip()
+            merged["name"] = name or f"account{i + 1}"
+            # 每个账号独立的游戏快照文件，避免互相覆盖
+            if not item.get("games_cache_csv"):
+                merged["games_cache_csv"] = f"games_auto_{merged['name']}.csv"
+            accounts.append(merged)
+    else:
+        one = _account_defaults(cfg)
+        one["name"] = str(cfg.get("account_name") or "default").strip() or "default"
+        if not one.get("games_cache_csv"):
+            one["games_cache_csv"] = "games_auto.csv"
+        accounts = [one]
+
+    for a in accounts:
+        src = (a.get("games_source") or "csv").strip().lower()
+        if src == "api" and not str(a.get("org_id") or "").strip():
+            logger.error("账号「%s」: games_source=api 时必须配置 org_id。", a["name"])
+            sys.exit(1)
+        if src == "csv" and not (a.get("games_csv") or "").strip():
+            logger.error("账号「%s」: games_source=csv 时必须配置 games_csv。", a["name"])
+            sys.exit(1)
+
+    names = [a["name"] for a in accounts]
+    if len(set(names)) != len(names):
+        logger.error("accounts 里的 name 有重复：%s（请保证唯一）。", names)
+        sys.exit(1)
+    return accounts
 
 
 # 登录态标记：不同浏览器/登录方式下会话 Cookie 命名不一（Chrome 常见
@@ -137,8 +200,8 @@ def _cookie_from_config(cfg: dict) -> str | None:
     return cookie
 
 
-def get_cookie_string(cfg: dict) -> str:
-    """获取 Cookie。
+def get_cookie_string(cfg: dict) -> str | None:
+    """获取 Cookie，失败返回 None（由调用方决定是跳过该账号还是退出）。
 
     - cookie_source=browser：优先从浏览器读取，失败时自动回退到 config 的 cookie。
     - cookie_source=config ：直接用 config 的 cookie。
@@ -153,17 +216,17 @@ def get_cookie_string(cfg: dict) -> str:
             return cookie
         cookie = _cookie_from_config(cfg)
         if cookie:
-            logger.warning("浏览器读取失败，已回退使用 config.yaml 里的 Cookie。")
+            logger.warning("浏览器读取失败，已回退使用 config 里的 Cookie。")
             return cookie
-        logger.error("浏览器读取失败，且 config.yaml 的 cookie 未填写/不完整，无法继续。")
-        logger.error("请在浏览器登录后台，或把有效 Cookie 粘贴到 config.yaml 的 cookie 字段。")
-        sys.exit(1)
+        logger.error("浏览器读取失败，且 config 的 cookie 未填写/不完整。")
+        logger.error("请在浏览器登录后台，或把有效 Cookie 粘贴到 config 的 cookie 字段。")
+        return None
 
     cookie = _cookie_from_config(cfg)
     if cookie:
         return cookie
-    logger.error("config.yaml 的 cookie 未填写或不完整，请从浏览器复制完整 Cookie。")
-    sys.exit(1)
+    logger.error("config 的 cookie 未填写或不完整，请从浏览器复制完整 Cookie。")
+    return None
 
 
 def _parse_date(raw: str) -> date:
@@ -462,7 +525,7 @@ def build_bq_record(data: dict, *, day: str, game: str, key: str, region_code: s
 def write_csv(path: Path, fieldnames: list, rows: list):
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8-sig", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
 
@@ -512,7 +575,11 @@ BQ_SCHEMA_FIELDS = [
 
 
 def upload_to_bigquery(records: list, days: list, bq_cfg: dict):
-    """delete-then-insert：先删指定日期范围，再追加写入本次抓取数据。"""
+    """delete-then-insert：先删本次抓取到的 (日期范围 × app_key)，再追加写入。
+
+    删除按 app_key 限定，这样多个账号写同一张表时互不影响：每个账号只清理
+    自己本次抓到的 key，不会误删另一账号已入库的数据。
+    """
     try:
         from google.cloud import bigquery
     except ImportError:
@@ -530,16 +597,24 @@ def upload_to_bigquery(records: list, days: list, bq_cfg: dict):
 
     client = bigquery.Client.from_service_account_json(creds)
 
+    keys = sorted({r["app_key"] for r in records if r.get("app_key")})
     start_date, end_date = min(days), max(days)
-    logger.info("BigQuery: 先删除 %s ~ %s 的旧数据 …", start_date, end_date)
+    logger.info(
+        "BigQuery: 先删除 %s ~ %s 的旧数据（限定本次 %d 个 app_key）…",
+        start_date,
+        end_date,
+        len(keys),
+    )
     delete_sql = (
         f"DELETE FROM `{table_id}` "
-        "WHERE stats_date >= @start_date AND stats_date <= @end_date"
+        "WHERE stats_date >= @start_date AND stats_date <= @end_date "
+        "AND app_key IN UNNEST(@keys)"
     )
     delete_cfg = bigquery.QueryJobConfig(
         query_parameters=[
             bigquery.ScalarQueryParameter("start_date", "DATE", start_date),
             bigquery.ScalarQueryParameter("end_date", "DATE", end_date),
+            bigquery.ArrayQueryParameter("keys", "STRING", keys),
         ]
     )
     client.query(delete_sql, job_config=delete_cfg).result()
@@ -610,7 +685,8 @@ def handle_login_failure(cfg: dict):
     logger.error("=" * 56)
 
 
-def print_summary(*, days, rows, skipped, failed, failures, out_path, bq_enabled):
+def print_summary(*, days, rows, skipped, failed, failures, out_path, bq_enabled,
+                  account_lines=None):
     """结束时打印关键数字摘要。"""
     total_rows = [r for r in rows if r["地区"] == "total"]
     region_rows = [r for r in rows if r["地区"] != "total"]
@@ -636,6 +712,11 @@ def print_summary(*, days, rows, skipped, failed, failures, out_path, bq_enabled
         lines.append(f"  请求失败   : {failed}")
     lines.append(f"  结果文件   : {out_path}")
     lines.append(f"  写入数仓   : {'是' if bq_enabled else '否'}")
+    if account_lines:
+        lines.append("-" * 56)
+        lines.append("  分账号：")
+        for al in account_lines:
+            lines.append(f"    {al}")
     if top and (top[0].get("广告收入(USD)") or 0) > 0:
         lines.append("-" * 56)
         lines.append("  收入 Top 5（游戏 @ 地区 @ 日期）：")
@@ -653,6 +734,72 @@ def print_summary(*, days, rows, skipped, failed, failures, out_path, bq_enabled
             lines.append(f"    {g} @ {rn} @ {d}: {msg}")
     lines.append("=" * 56)
     print("\n".join(lines))
+
+
+def run_account(account: dict, *, days, regions, ad_type, concurrency, max_retries) -> dict:
+    """抓取单个账号，返回结果 dict（rows/bq_records/统计/是否登录失效）。
+
+    单账号内部出现的硬失败（如取不到游戏列表）不会中断其它账号：捕获 SystemExit
+    后当作该账号失败处理。
+    """
+    name = account["name"]
+    cookie = get_cookie_string(account)
+    if not cookie:
+        logger.error("账号「%s」: 无法获取有效 Cookie，跳过该账号。", name)
+        return {"rows": [], "bq_records": [], "skipped": 0, "failed": 0,
+                "failures": [], "login_failed": True}
+
+    session = build_session(cookie, concurrency=concurrency, max_retries=max_retries)
+    try:
+        games = resolve_games(account, session)
+    except SystemExit:
+        logger.error("账号「%s」: 获取游戏列表失败，跳过该账号。", name)
+        return {"rows": [], "bq_records": [], "skipped": 0, "failed": 0,
+                "failures": [], "login_failed": True}
+
+    total = len(games) * len(regions) * len(days)
+    logger.info(
+        "账号「%s」: 游戏 %d 个 | 地区 %d 个（含全部） | 共 %d 个请求",
+        name, len(games), len(regions), total,
+    )
+
+    tasks = [(game, region, day) for day in days for game in games for region in regions]
+    abort_event = threading.Event()
+    rows: list = []
+    bq_records: list = []
+    failures: list = []
+    skipped = 0
+    failed = 0
+    login_failed = False
+
+    bar = ProgressBar(total)
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        futures = {
+            executor.submit(_do_one, session, game, region, day, ad_type, abort_event): (
+                game, region, day,
+            )
+            for game, region, day in tasks
+        }
+        for future in as_completed(futures):
+            game, region, day = futures[future]
+            region_name = region[0]
+            status, payload = future.result()
+            if status == "ok":
+                row, bq = payload
+                rows.append({"账号": name, **row})
+                bq_records.append(bq)
+            elif status == "nodata":
+                skipped += 1
+            elif status == "failed":
+                failed += 1
+                failures.append((f"[{name}] {game['name']}", region_name, day, str(payload)))
+            elif status == "login":
+                login_failed = True
+            bar.update()
+    bar.close()
+
+    return {"rows": rows, "bq_records": bq_records, "skipped": skipped,
+            "failed": failed, "failures": failures, "login_failed": login_failed}
 
 
 def main():
@@ -677,100 +824,85 @@ def main():
     if args.cookie_source:
         cfg["cookie_source"] = args.cookie_source
 
-    cookie = get_cookie_string(cfg)
+    accounts = resolve_accounts(cfg)
+    if args.cookie_source:
+        for a in accounts:
+            a["cookie_source"] = args.cookie_source
+
     days = resolve_dates(cfg, args.date, start=args.start, end=args.end, days=args.days)
     ad_type = int(cfg.get("ad_type", 1))
     concurrency = max(int(cfg.get("concurrency", 8)), 1)
     max_retries = int(cfg.get("max_retries", 2))
     regions = resolve_regions(cfg)
 
-    session = build_session(cookie, concurrency=concurrency, max_retries=max_retries)
-    games = resolve_games(cfg, session)
-
-    total = len(games) * len(regions) * len(days)
+    multi = len(accounts) > 1
     logger.info(
-        "抓取日期=%s | 游戏 %d 个 | 地区 %d 个（含全部） | 共 %d 个请求 | 并发 %d",
-        ",".join(days),
-        len(games),
-        len(regions),
-        total,
-        concurrency,
+        "抓取日期=%s | 账号 %d 个 | 地区 %d 个（含全部） | 并发 %d",
+        ",".join(days), len(accounts), len(regions), concurrency,
     )
 
-    tasks = [(game, region, day) for day in days for game in games for region in regions]
-    abort_event = threading.Event()
-    rows: list = []
-    bq_records: list = []
-    failures: list = []  # (game, region_name, day, msg)
-    skipped = 0
-    failed = 0
-    login_failed = False
+    all_rows: list = []
+    all_bq: list = []
+    all_failures: list = []
+    total_skipped = 0
+    total_failed = 0
+    any_login_fail = False
+    account_lines: list = []
 
-    bar = ProgressBar(total)
-    with ThreadPoolExecutor(max_workers=concurrency) as executor:
-        futures = {
-            executor.submit(_do_one, session, game, region, day, ad_type, abort_event): (
-                game,
-                region,
-                day,
-            )
-            for game, region, day in tasks
-        }
-        for future in as_completed(futures):
-            game, region, day = futures[future]
-            region_name = region[0]
-            status, payload = future.result()
-            if status == "ok":
-                row, bq = payload
-                rows.append(row)
-                bq_records.append(bq)
-            elif status == "nodata":
-                skipped += 1
-            elif status == "failed":
-                failed += 1
-                failures.append((game["name"], region_name, day, str(payload)))
-            elif status == "login":
-                login_failed = True
-            # aborted: 静默跳过（登录失效后剩余任务）
-            bar.update()
-    bar.close()
+    for account in accounts:
+        logger.info("========== 账号「%s」==========", account["name"])
+        res = run_account(
+            account, days=days, regions=regions, ad_type=ad_type,
+            concurrency=concurrency, max_retries=max_retries,
+        )
+        all_rows += res["rows"]
+        all_bq += res["bq_records"]
+        total_skipped += res["skipped"]
+        total_failed += res["failed"]
+        all_failures += res["failures"]
+        if res["login_failed"]:
+            any_login_fail = True
+            handle_login_failure(account)
 
-    if login_failed:
-        handle_login_failure(cfg)
-        if not rows:
-            sys.exit(2)
+        acc_rows = res["rows"]
+        trows = [r for r in acc_rows if r["地区"] == "total"]
+        basis = trows if trows else [r for r in acc_rows if r["地区"] != "total"]
+        sub_rev = sum((r.get("广告收入(USD)") or 0) for r in basis)
+        account_lines.append(f"{account['name']}: {len(acc_rows)} 行, 收入 ${sub_rev:,.2f}")
 
-    if not rows:
-        logger.error("没有抓取到任何数据。")
-        sys.exit(3)
+    if not all_rows:
+        logger.error("所有账号都没有抓到数据。")
+        sys.exit(2 if any_login_fail else 3)
 
-    # 排序：游戏 -> 地区 -> 日期，便于对比两天
-    rows.sort(key=lambda r: (r["游戏"], r["地区"], r["日期"]))
+    all_rows.sort(key=lambda r: (r.get("账号", ""), r["游戏"], r["地区"], r["日期"]))
 
     fieldnames = ["日期", "游戏", "key", "地区", *[METRIC_HEADERS[m] for m in METRICS]]
+    if multi:
+        fieldnames = ["账号", *fieldnames]
     sorted_days = sorted(days)
     suffix = sorted_days[0] if len(sorted_days) == 1 else f"{sorted_days[0]}_{sorted_days[-1]}"
     out_path = Path(args.output_dir) / f"iaa_{suffix}.csv"
-    write_csv(out_path, fieldnames, rows)
+    write_csv(out_path, fieldnames, all_rows)
 
     bq_cfg = cfg.get("bigquery") or {}
     bq_enabled = bool(bq_cfg.get("enabled"))
     if bq_enabled:
-        if failed:
+        if total_failed:
             logger.warning(
                 "有 %d 个请求失败，本次数据不完整；仍按配置写入 BigQuery（如需完整数据请重跑）。",
-                failed,
+                total_failed,
             )
-        upload_to_bigquery(bq_records, sorted_days, bq_cfg)
+        upload_to_bigquery(all_bq, sorted_days, bq_cfg)
 
     print_summary(
         days=days,
-        rows=rows,
-        skipped=skipped,
-        failed=failed,
-        failures=failures,
+        rows=all_rows,
+        skipped=total_skipped,
+        failed=total_failed,
+        failures=all_failures,
         out_path=out_path,
         bq_enabled=bq_enabled,
+        account_lines=account_lines if multi else None,
     )
 
 

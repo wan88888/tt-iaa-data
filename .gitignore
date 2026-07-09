@@ -11,7 +11,7 @@ service-account*.json
 
 # 游戏信息表（含内部 key，不提交仓库）
 游戏信息表 - TT.csv
-games_auto.csv
+games_auto*.csv
 
 # 运行环境与输出
 .venv/

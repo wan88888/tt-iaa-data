@@ -4,22 +4,30 @@
 # config.yaml 含 Cookie 等敏感信息，已在 .gitignore 中排除，勿提交。
 # ============================================================
 
-# Cookie 来源：
-#   browser = 优先从本机已登录浏览器读取；读取失败时自动回退用下面的 cookie 字段
-#   config  = 直接用下面的 cookie 字段（手动从浏览器复制粘贴）
-cookie_source: "browser"
-
-# browser 模式时从哪个浏览器读 Cookie（需已在该浏览器登录开发者后台）：
-#   chrome / firefox / edge / safari 等（由 browser-cookie3 支持）
-browser: "chrome"
-
 # 登录态失效时，是否自动打开后台登录页（仅在终端交互运行时生效）
 open_login_on_expire: true
 
-# 手动 Cookie（cookie_source=config 时使用，或 browser 读取失败时的回退）
-# 步骤：打开 https://developers.tiktok.com/ 并登录 ->
-#       F12 -> Network -> 找到 iaa 请求 -> Copy as cURL -> 复制 -b '...' 引号内内容
-cookie: ""
+# ===== 账号 =====
+# 支持一个或多个账号（每个账号 = 一个 TikTok 组织 org_id）。一次运行会依次
+# 抓取所有账号，结果合并到同一 CSV / 同一张 BQ 表（用 app_game/app_key/账号 区分）。
+# 字段说明：
+#   name          账号别名（唯一，用于日志/CSV 账号列/游戏快照文件名）
+#   cookie_source browser=从该浏览器已登录态自动读；config=用该账号的 cookie 字段
+#   browser       chrome / firefox / edge / safari 等（cookie_source=browser 时）
+#   org_id        组织 ID，来自后台链接 organization/<这串数字>
+#   cookie        手动 Cookie（cookie_source=config，或 browser 读取失败时的回退）
+# 多账号建议：不同账号在不同浏览器分别登录（如账号1用 Chrome、账号2用 Firefox）。
+accounts:
+  - name: "account1"
+    cookie_source: "browser"
+    browser: "chrome"
+    org_id: ""
+    cookie: ""
+  # - name: "account2"
+  #   cookie_source: "browser"
+  #   browser: "firefox"
+  #   org_id: ""
+  #   cookie: ""
 
 # 抓取日期：
 #   留空 ""  = 自动取最近 days_back 天，最新一天为「今天 - date_offset_days」
@@ -30,15 +38,17 @@ date_offset_days: 1
 days_back: 2
 ad_type: 1
 
+# 以下为所有账号共享的默认值（可在 accounts 里按账号覆盖）。
+
 # 游戏来源：api（推荐，自动获取）| csv（读本地游戏表）
 games_source: "api"
 
-# 组织 ID（games_source=api 时必填）。来自后台链接 organization/<这串数字>
-org_id: ""
+# org_id 已在 accounts 里按账号配置，无需顶层 org_id。
 
 approved_only: true
 exclude_games: []
-games_cache_csv: "games_auto.csv"
+# 多账号时脚本自动用 games_auto_<账号名>.csv，无需手动指定
+# games_cache_csv: "games_auto.csv"
 games_csv: "游戏信息表 - TT.csv"
 game_status_filter: ["已过审"]
 

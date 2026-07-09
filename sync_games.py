@@ -174,6 +174,9 @@ def main():
         sys.exit(1)
 
     cookie = scraper.get_cookie_string(cfg)
+    if not cookie:
+        logger.error("无法获取有效 Cookie（浏览器未登录或 config cookie 失效）。")
+        sys.exit(1)
     session = scraper.build_session(cookie, concurrency=8)
     games = fetch_games_from_api(
         session,
