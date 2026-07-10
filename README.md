@@ -48,6 +48,7 @@ cp config.example.yaml config.yaml
 5. **date / date_offset_days / days_back**：`date` 留空时自动抓最近 `days_back` 天（默认 2 = 昨天 + 前天），最新一天为「今天 - date_offset_days」。也可把 `date` 写成具体某天（如 `"2026-06-11"`，只抓那天）。
 6. **game_status_filter**：仅 `games_source=csv` 生效，只抓这些状态的游戏，默认 `["已过审"]`。
 7. **regions**：地区中文/英文名列表，脚本自动转地区码。
+8. **限流相关**（多账号时尤其重要）：`concurrency`（默认 4）、`account_pause_seconds`（账号间暂停）、`failed_retry_rounds` / `failed_retry_pause_seconds` / `failed_retry_concurrency`（429 限流后自动补抓）。若日志仍出现大量 `429 Too Many Requests`，可把 `concurrency` 降到 2 或加大 `account_pause_seconds`。
 
 ### 自动同步游戏列表
 

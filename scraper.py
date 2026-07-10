@@ -11,6 +11,7 @@ import csv
 import logging
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -386,11 +387,17 @@ def resolve_games(cfg: dict, session) -> list[dict]:
     return load_games(Path(cfg["games_csv"]), cfg.get("game_status_filter") or [])
 
 
-def build_session(cookie: str, *, concurrency: int = 1, max_retries: int = 2) -> requests.Session:
+def build_session(
+    cookie: str,
+    *,
+    concurrency: int = 1,
+    max_retries: int = 4,
+    retry_backoff_factor: float = 1.5,
+) -> requests.Session:
     session = requests.Session()
     retry = Retry(
         total=max_retries,
-        backoff_factor=0.6,
+        backoff_factor=retry_backoff_factor,
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["GET"],
         raise_on_status=False,
@@ -558,6 +565,82 @@ def _do_one(session, game, region, day, ad_type, abort_event):
         data, day=day, game=game["name"], key=game["client_key"], region_code=region_code
     )
     return ("ok", (row, bq))
+
+
+def _is_rate_limit_error(exc) -> bool:
+    if isinstance(exc, requests.HTTPError) and exc.response is not None:
+        return exc.response.status_code == 429
+    text = str(exc).lower()
+    return "429" in text or "too many requests" in text
+
+
+def _execute_tasks(
+    session,
+    account_name: str,
+    tasks: list,
+    *,
+    ad_type: int,
+    concurrency: int,
+) -> dict:
+    """并发执行一批 (游戏, 地区, 日期) 任务。"""
+    abort_event = threading.Event()
+    rows: list = []
+    bq_records: list = []
+    skipped = 0
+    retryable_failed: list = []
+    other_failures: list = []
+    login_failed = False
+
+    if not tasks:
+        return {
+            "rows": rows,
+            "bq_records": bq_records,
+            "skipped": skipped,
+            "retryable_failed": retryable_failed,
+            "other_failures": other_failures,
+            "login_failed": login_failed,
+        }
+
+    bar = ProgressBar(len(tasks))
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        futures = {
+            executor.submit(_do_one, session, game, region, day, ad_type, abort_event): (
+                game,
+                region,
+                day,
+            )
+            for game, region, day in tasks
+        }
+        for future in as_completed(futures):
+            game, region, day = futures[future]
+            region_name = region[0]
+            status, payload = future.result()
+            if status == "ok":
+                row, bq = payload
+                rows.append({"账号": account_name, **row})
+                bq_records.append(bq)
+            elif status == "nodata":
+                skipped += 1
+            elif status == "failed":
+                if _is_rate_limit_error(payload):
+                    retryable_failed.append((game, region, day))
+                else:
+                    other_failures.append(
+                        (f"[{account_name}] {game['name']}", region_name, day, str(payload))
+                    )
+            elif status == "login":
+                login_failed = True
+            bar.update()
+    bar.close()
+
+    return {
+        "rows": rows,
+        "bq_records": bq_records,
+        "skipped": skipped,
+        "retryable_failed": retryable_failed,
+        "other_failures": other_failures,
+        "login_failed": login_failed,
+    }
 
 
 BQ_SCHEMA_FIELDS = [
@@ -736,11 +819,23 @@ def print_summary(*, days, rows, skipped, failed, failures, out_path, bq_enabled
     print("\n".join(lines))
 
 
-def run_account(account: dict, *, days, regions, ad_type, concurrency, max_retries) -> dict:
+def run_account(
+    account: dict,
+    *,
+    days,
+    regions,
+    ad_type,
+    concurrency,
+    max_retries,
+    retry_backoff_factor,
+    failed_retry_rounds,
+    failed_retry_pause_seconds,
+    failed_retry_concurrency,
+) -> dict:
     """抓取单个账号，返回结果 dict（rows/bq_records/统计/是否登录失效）。
 
     单账号内部出现的硬失败（如取不到游戏列表）不会中断其它账号：捕获 SystemExit
-    后当作该账号失败处理。
+    后当作该账号失败处理。遇 429 限流会在主批次结束后自动降并发补抓。
     """
     name = account["name"]
     cookie = get_cookie_string(account)
@@ -749,7 +844,12 @@ def run_account(account: dict, *, days, regions, ad_type, concurrency, max_retri
         return {"rows": [], "bq_records": [], "skipped": 0, "failed": 0,
                 "failures": [], "login_failed": True}
 
-    session = build_session(cookie, concurrency=concurrency, max_retries=max_retries)
+    session = build_session(
+        cookie,
+        concurrency=concurrency,
+        max_retries=max_retries,
+        retry_backoff_factor=retry_backoff_factor,
+    )
     try:
         games = resolve_games(account, session)
     except SystemExit:
@@ -757,49 +857,57 @@ def run_account(account: dict, *, days, regions, ad_type, concurrency, max_retri
         return {"rows": [], "bq_records": [], "skipped": 0, "failed": 0,
                 "failures": [], "login_failed": True}
 
-    total = len(games) * len(regions) * len(days)
+    tasks = [(game, region, day) for day in days for game in games for region in regions]
     logger.info(
-        "账号「%s」: 游戏 %d 个 | 地区 %d 个（含全部） | 共 %d 个请求",
-        name, len(games), len(regions), total,
+        "账号「%s」: 游戏 %d 个 | 地区 %d 个（含全部） | 共 %d 个请求 | 并发 %d",
+        name, len(games), len(regions), len(tasks), concurrency,
     )
 
-    tasks = [(game, region, day) for day in days for game in games for region in regions]
-    abort_event = threading.Event()
-    rows: list = []
-    bq_records: list = []
-    failures: list = []
-    skipped = 0
-    failed = 0
-    login_failed = False
+    result = _execute_tasks(
+        session, name, tasks, ad_type=ad_type, concurrency=concurrency,
+    )
+    rows = result["rows"]
+    bq_records = result["bq_records"]
+    skipped = result["skipped"]
+    other_failures = result["other_failures"]
+    login_failed = result["login_failed"]
+    pending = result["retryable_failed"]
 
-    bar = ProgressBar(total)
-    with ThreadPoolExecutor(max_workers=concurrency) as executor:
-        futures = {
-            executor.submit(_do_one, session, game, region, day, ad_type, abort_event): (
-                game, region, day,
-            )
-            for game, region, day in tasks
-        }
-        for future in as_completed(futures):
-            game, region, day = futures[future]
-            region_name = region[0]
-            status, payload = future.result()
-            if status == "ok":
-                row, bq = payload
-                rows.append({"账号": name, **row})
-                bq_records.append(bq)
-            elif status == "nodata":
-                skipped += 1
-            elif status == "failed":
-                failed += 1
-                failures.append((f"[{name}] {game['name']}", region_name, day, str(payload)))
-            elif status == "login":
-                login_failed = True
-            bar.update()
-    bar.close()
+    retry_conc = max(min(failed_retry_concurrency, concurrency), 1)
+    for rnd in range(1, failed_retry_rounds + 1):
+        if not pending or login_failed:
+            break
+        logger.info(
+            "账号「%s」: %d 个请求因限流(429)失败，等待 %ds 后进行第 %d/%d 轮补抓（并发 %d）…",
+            name, len(pending), failed_retry_pause_seconds, rnd, failed_retry_rounds, retry_conc,
+        )
+        time.sleep(failed_retry_pause_seconds)
+        retry_result = _execute_tasks(
+            session, name, pending, ad_type=ad_type, concurrency=retry_conc,
+        )
+        rows += retry_result["rows"]
+        bq_records += retry_result["bq_records"]
+        skipped += retry_result["skipped"]
+        other_failures += retry_result["other_failures"]
+        if retry_result["login_failed"]:
+            login_failed = True
+            break
+        pending = retry_result["retryable_failed"]
 
-    return {"rows": rows, "bq_records": bq_records, "skipped": skipped,
-            "failed": failed, "failures": failures, "login_failed": login_failed}
+    failures = other_failures + [
+        (f"[{name}] {game['name']}", region[0], day, "429 Too Many Requests（补抓后仍失败）")
+        for game, region, day in pending
+    ]
+    failed = len(failures)
+
+    return {
+        "rows": rows,
+        "bq_records": bq_records,
+        "skipped": skipped,
+        "failed": failed,
+        "failures": failures,
+        "login_failed": login_failed,
+    }
 
 
 def main():
@@ -831,14 +939,19 @@ def main():
 
     days = resolve_dates(cfg, args.date, start=args.start, end=args.end, days=args.days)
     ad_type = int(cfg.get("ad_type", 1))
-    concurrency = max(int(cfg.get("concurrency", 8)), 1)
-    max_retries = int(cfg.get("max_retries", 2))
+    concurrency = max(int(cfg.get("concurrency", 4)), 1)
+    max_retries = int(cfg.get("max_retries", 4))
+    retry_backoff_factor = float(cfg.get("retry_backoff_factor", 1.5))
+    account_pause_seconds = max(int(cfg.get("account_pause_seconds", 45)), 0)
+    failed_retry_rounds = max(int(cfg.get("failed_retry_rounds", 2)), 0)
+    failed_retry_pause_seconds = max(int(cfg.get("failed_retry_pause_seconds", 30)), 0)
+    failed_retry_concurrency = max(int(cfg.get("failed_retry_concurrency", 2)), 1)
     regions = resolve_regions(cfg)
 
     multi = len(accounts) > 1
     logger.info(
-        "抓取日期=%s | 账号 %d 个 | 地区 %d 个（含全部） | 并发 %d",
-        ",".join(days), len(accounts), len(regions), concurrency,
+        "抓取日期=%s | 账号 %d 个 | 地区 %d 个（含全部） | 并发 %d | 限流补抓 %d 轮",
+        ",".join(days), len(accounts), len(regions), concurrency, failed_retry_rounds,
     )
 
     all_rows: list = []
@@ -849,11 +962,22 @@ def main():
     any_login_fail = False
     account_lines: list = []
 
-    for account in accounts:
+    for idx, account in enumerate(accounts):
+        if idx > 0 and multi and account_pause_seconds > 0:
+            logger.info("多账号间隔 %d 秒，降低 API 限流风险…", account_pause_seconds)
+            time.sleep(account_pause_seconds)
         logger.info("========== 账号「%s」==========", account["name"])
         res = run_account(
-            account, days=days, regions=regions, ad_type=ad_type,
-            concurrency=concurrency, max_retries=max_retries,
+            account,
+            days=days,
+            regions=regions,
+            ad_type=ad_type,
+            concurrency=concurrency,
+            max_retries=max_retries,
+            retry_backoff_factor=retry_backoff_factor,
+            failed_retry_rounds=failed_retry_rounds,
+            failed_retry_pause_seconds=failed_retry_pause_seconds,
+            failed_retry_concurrency=failed_retry_concurrency,
         )
         all_rows += res["rows"]
         all_bq += res["bq_records"]

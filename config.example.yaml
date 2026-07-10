@@ -66,8 +66,13 @@ regions:
   - Saudi Arabia
   - Turkey
 
-concurrency: 8
-max_retries: 2
+concurrency: 4
+max_retries: 4
+retry_backoff_factor: 1.5
+account_pause_seconds: 45
+failed_retry_rounds: 2
+failed_retry_pause_seconds: 30
+failed_retry_concurrency: 2
 
 bigquery:
   enabled: false
